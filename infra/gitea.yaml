@@ -125,7 +125,7 @@ spec:
     name: gitea
   tls:
     termination: edge
-    insecureEdgeTerminationPolicy: None
+    insecureEdgeTerminationPolicy: Redirect
 ---
 apiVersion: apps/v1
 kind: Deployment

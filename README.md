@@ -13,10 +13,10 @@ This repo is a CI/CD demo using [Tekton Pipelines](http://www.tekton.dev) for co
   <img width="580" src="docs/images/projects.svg">
 </p>
 
-## Prerequisites
+## Tested Configuration
 
-* OpenShift GitOps 1.12+
-* OpenShift Pipelines 1.14+
+* OpenShift GitOps 1.15
+* OpenShift Pipelines 1.17
 
 ## Continuous Integration
 
@@ -49,9 +49,12 @@ Argo CD continuously monitor the configurations stored in the Git repository and
     $ git clone https://github.com/siamaksade/openshift-cicd-demo
     $ demo.sh install
     ```
+## Credentials
+* Nexus: `admin`/`admin123`
+* Gitea: `gitea`/`openshift`
+* SonarQube: `admin`/`sonarqube`
 
 ## Demo Instructions
-
 1. Go to spring-petclinic Git repository in Gitea
 1. Log into Gitea with username/password: `gitea`/`openshift`
 1. Edit a file in the repository and commit to trigger the pipeline. Alternatively, create a pull-request instead to see the result on the deployed app before merging.

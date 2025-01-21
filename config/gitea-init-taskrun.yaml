@@ -13,6 +13,10 @@ spec:
       type: string
       description: Gitea admin password
       default: openshift
+    - name: GITEA_URL
+      type: string
+      description: Gitea url
+      default: @gitea-url@
     - name: WEBHOOK_URL
       type: string
       description: The pipelines-as-code webhook url
@@ -29,13 +33,11 @@ spec:
         script: |
           #!/usr/bin/env python3
 
-          import os
           import requests 
 
           gitea_user = "$(params.GITEA_USER)"
           gitea_pwd = "$(params.GITEA_PASSWORD)"
-          giteaURL = "http://" + os.popen('oc get svc gitea -o template --template="{{.spec.clusterIP}}"').read() + ":3000"
-          # webhookURL = "http://" + os.popen('oc get route el-webhook -o template --template="{{.spec.host}}"').read()
+          giteaURL = "$(params.GITEA_URL)"
           webhookURL = "$(params.WEBHOOK_URL)"
 
           # create admin user
@@ -106,7 +108,7 @@ spec:
             print("Created git repo spring-petclinic-config")
 
           # create token for user
-          data_token = '{"name": "cicd"}'
+          data_token = '{"name": "cicd", "scopes": ["write:admin", "write:issue", "write:misc", "write:notification", "write:repository"]}'
           headers = {'Content-Type': 'application/json'}
           resp = requests.post(url = giteaURL + "/api/v1/users/" + gitea_user + "/tokens", headers = headers, auth = (gitea_user, gitea_pwd), data = data_token)  
           resp.raise_for_status()

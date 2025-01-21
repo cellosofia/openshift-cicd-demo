@@ -94,6 +94,9 @@ spec:
     kind: Service
     name: nexus
     weight: 100
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: None
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim

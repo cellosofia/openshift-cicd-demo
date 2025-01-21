@@ -122,7 +122,7 @@ command.install() {
 
   sed "s/@HOSTNAME/$GITEA_HOSTNAME/g" config/gitea-configmap.yaml | oc create -f - -n $cicd_prj
   oc rollout status deployment/gitea -n $cicd_prj
-  sed "s#@webhook-url@#https://$WEBHOOK_URL#g" config/gitea-init-taskrun.yaml | oc create -f - -n $cicd_prj
+  sed "s#@webhook-url@#https://$WEBHOOK_URL#g" config/gitea-init-taskrun.yaml | sed "s#@gitea-url@#https://$GITEA_HOSTNAME#g" config/gitea-init-taskrun.yaml |  oc create -f - -n $cicd_prj
 
 
   wait_seconds 20
@@ -145,7 +145,7 @@ command.install() {
   
   wait_seconds 5
 
-  info "Updated pipelinerun values for the demo environment"
+  info "Updating pipelinerun values for the demo environment"
   tmp_dir=$(mktemp -d)
   pushd $tmp_dir
   git clone https://$GITEA_HOSTNAME/gitea/spring-petclinic 
@@ -176,7 +176,7 @@ metadata:
 spec:
   url: https://$GITEA_HOSTNAME/gitea/spring-petclinic
   git_provider:
-    user: "git"
+    user: git
     url: https://$GITEA_HOSTNAME
     secret:
       name: "gitea"
@@ -261,7 +261,7 @@ EOF
 
   Gitea Git Server: https://$GITEA_HOSTNAME/explore/repos
   SonarQube: https://$(oc get route sonarqube -o template --template='{{.spec.host}}' -n $cicd_prj)
-  Sonatype Nexus: http://$(oc get route nexus -o template --template='{{.spec.host}}' -n $cicd_prj)
+  Sonatype Nexus: https://$(oc get route nexus -o template --template='{{.spec.host}}' -n $cicd_prj)
   Argo CD:  http://$(oc get route argocd-server -o template --template='{{.spec.host}}' -n $cicd_prj)  [login with OpenShift credentials]
 
 ############################################################################
