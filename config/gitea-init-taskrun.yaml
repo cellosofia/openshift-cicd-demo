@@ -33,7 +33,8 @@ spec:
         script: |
           #!/usr/bin/env python3
 
-          import requests 
+          import requests
+          import os
 
           gitea_user = "$(params.GITEA_USER)"
           gitea_pwd = "$(params.GITEA_PASSWORD)"

@@ -122,7 +122,7 @@ command.install() {
 
   sed "s/@HOSTNAME/$GITEA_HOSTNAME/g" config/gitea-configmap.yaml | oc create -f - -n $cicd_prj
   oc rollout status deployment/gitea -n $cicd_prj
-  sed "s#@webhook-url@#https://$WEBHOOK_URL#g" config/gitea-init-taskrun.yaml | sed "s#@gitea-url@#https://$GITEA_HOSTNAME#g" config/gitea-init-taskrun.yaml |  oc create -f - -n $cicd_prj
+  sed "s#@webhook-url@#https://$WEBHOOK_URL#g" config/gitea-init-taskrun.yaml | sed "s#@gitea-url@#https://$GITEA_HOSTNAME#g" |  oc create -f - -n $cicd_prj
 
 
   wait_seconds 20
