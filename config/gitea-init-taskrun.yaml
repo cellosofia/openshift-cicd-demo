@@ -3,7 +3,7 @@ kind: TaskRun
 metadata:
   generateName: init-gitea-
 spec:
-  podTemplate:
+  taskSpec:
     volumes:
       - name: ca-bundle
         configMap:
@@ -11,7 +11,6 @@ spec:
           items:
             - key: ca-bundle.crt
               path: tls-ca-bundle.pem
-  taskSpec:
     params:
     - name: GITEA_USER
       type: string
@@ -35,6 +34,8 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.namespace
+        - name: REQUESTS_CA_BUNDLE
+          value: /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
     steps:
       - name: init-gitea
         image: quay.io/siamaksade/python-oc
@@ -70,7 +71,7 @@ spec:
             print("Created admin user {}:{}".format(gitea_user, gitea_pwd))
 
           # create git repo spring-petclinic
-          data_repo = '{"clone_addr": "https://github.com/siamaksade/spring-petclinic-pac", "uid": 1, "repo_name": "spring-petclinic"}'
+          data_repo = '{"clone_addr": "https://github.com/cellosofia/spring-petclinic-pac", "uid": 1, "repo_name": "spring-petclinic"}'
           headers = {'Content-Type': 'application/json'}
           resp = requests.post(url = giteaURL + "/api/v1/repos/migrate", headers = headers, auth = (gitea_user, gitea_pwd), data = data_repo)  
 

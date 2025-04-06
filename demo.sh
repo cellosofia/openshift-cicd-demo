@@ -21,9 +21,9 @@ err() {
 
 wait_seconds() {
   local count=${1:-5}
-  for i in {1..$count}
+  for i in $(seq 1 $count)
   do
-    echo "."
+    echo -n "."
     sleep 1
   done
   printf "\n"
@@ -144,6 +144,8 @@ command.install() {
   done
   
   wait_seconds 5
+  
+  sleep 10
 
   info "Updating pipelinerun values for the demo environment"
   tmp_dir=$(mktemp -d)

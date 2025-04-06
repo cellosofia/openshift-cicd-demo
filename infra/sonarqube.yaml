@@ -351,9 +351,9 @@ spec:
               protocol: TCP
           resources:
             limits:
-              cpu: 800m
-              ephemeral-storage: 5Gi
-              memory: 3Gi
+              cpu: "4"
+              ephemeral-storage: 10Gi
+              memory: 8Gi
             requests:
               cpu: 400m
               ephemeral-storage: 1Gi
