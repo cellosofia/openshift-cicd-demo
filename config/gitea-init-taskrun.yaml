@@ -3,6 +3,14 @@ kind: TaskRun
 metadata:
   generateName: init-gitea-
 spec:
+  podTemplate:
+    volumes:
+      - name: ca-bundle
+        configMap:
+          name: ca-bundle
+          items:
+            - key: ca-bundle.crt
+              path: tls-ca-bundle.pem
   taskSpec:
     params:
     - name: GITEA_USER
@@ -30,6 +38,10 @@ spec:
     steps:
       - name: init-gitea
         image: quay.io/siamaksade/python-oc
+        volumeMounts:
+          - name: ca-bundle
+            mountPath: /etc/pki/ca-trust/extracted/pem
+            readOnly: true
         script: |
           #!/usr/bin/env python3
 
