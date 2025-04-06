@@ -24,3 +24,13 @@ spec:
       g, system:cluster-admins, role:admin
       g, ocp-admins, role:admin
     scopes: '[groups]'
+  repo:
+    volumeMounts:
+      - mountPath: /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
+        name: ca-bundle
+        subPath: ca-bundle.crt
+    volumes:
+      - name: ca-bundle
+        configMap:
+          name: ca-bundle
+      
