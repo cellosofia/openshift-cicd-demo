@@ -1,7 +1,7 @@
 #!/bin/bash
 
 set -e -u -o pipefail
-SCRIPT_DIR=$(cd -P $(dirname $0) && pwd)
+SCRIPT_DIR="$(cd -P "$(dirname "$0")" && pwd)"
 declare -r SCRIPT_DIR
 declare PRJ_PREFIX="demo"
 declare COMMAND="help"
@@ -13,11 +13,11 @@ valid_command() {
 }
 
 info() {
-  printf "\n# INFO: $@\n"
+  printf "\n# INFO: %s\n" "$@"
 }
 
 err() {
-  printf "\n# ERROR: $1\n"
+  printf "\n# ERROR: %s\n" "$@"
   exit 1
 }
 
