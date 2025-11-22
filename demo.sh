@@ -92,9 +92,273 @@ command.help() {
 EOF
 }
 
+wait_for_operator() {
+  local subscription_name=$1
+  local namespace=${2:-openshift-operators}
+  local max_wait=${3:-600}
+  local elapsed=0
+
+  info "Esperando a que el operador de la subscription $subscription_name esté completamente instalado..."
+  
+  while [ $elapsed -lt $max_wait ]; do
+    # Obtener el nombre del CSV instalado desde la subscription
+    csv=$(oc get subscription "$subscription_name" -n "$namespace" -o jsonpath='{.status.installedCSV}' 2>/dev/null || echo "")
+    
+    if [ -n "$csv" ] && [ "$csv" != "null" ]; then
+      # Verificar que el CSV existe y está en estado Succeeded
+      phase=$(oc get csv "$csv" -n "$namespace" -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+      
+      if [ "$phase" == "Succeeded" ]; then
+        info "Operador $subscription_name instalado correctamente (CSV: $csv)"
+        return 0
+      fi
+      
+      # Mostrar el estado actual si no está en Succeeded
+      if [ -n "$phase" ] && [ "$phase" != "Succeeded" ]; then
+        echo -n "[$phase]"
+      fi
+    else
+      # Si aún no hay CSV instalado, verificar el estado de la subscription
+      install_plan=$(oc get subscription "$subscription_name" -n "$namespace" -o jsonpath='{.status.installPlanRef.name}' 2>/dev/null || echo "")
+      if [ -n "$install_plan" ] && [ "$install_plan" != "null" ]; then
+        echo -n "[installing]"
+      fi
+    fi
+    
+    echo -n "."
+    sleep 10
+    elapsed=$((elapsed + 10))
+  done
+  
+  err "Timeout esperando a que el operador $subscription_name se instale (esperado: $max_wait segundos)"
+}
+
+install_openshift_pipelines() {
+  local namespace="openshift-operators"
+  
+  info "Instalando operador OpenShift Pipelines..."
+  
+  # Verificar si el namespace openshift-operators existe
+  oc get ns "$namespace" >/dev/null 2>&1 || {
+    info "Creando namespace $namespace"
+    oc create namespace "$namespace"
+  }
+  
+  # Verificar si ya existe una subscription
+  if oc get subscription openshift-pipelines-operator-rh -n "$namespace" >/dev/null 2>&1; then
+    info "El operador OpenShift Pipelines ya está suscrito"
+  else
+    # Crear OperatorGroup si no existe (aunque openshift-operators ya debería tener uno)
+    if ! oc get operatorgroup -n "$namespace" >/dev/null 2>&1; then
+      cat <<EOF | oc apply -f -
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: openshift-operators
+  namespace: $namespace
+spec:
+  targetNamespaces: []
+EOF
+    fi
+    
+    # Crear Subscription para OpenShift Pipelines
+    cat <<EOF | oc apply -f -
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: openshift-pipelines-operator-rh
+  namespace: $namespace
+spec:
+  channel: latest
+  name: openshift-pipelines-operator-rh
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  installPlanApproval: Automatic
+EOF
+  fi
+  
+  wait_for_operator "openshift-pipelines-operator-rh" "$namespace"
+}
+
+install_openshift_gitops() {
+  local namespace="openshift-operators"
+  
+  info "Instalando operador OpenShift GitOps..."
+  
+  # Verificar si el namespace openshift-operators existe
+  oc get ns "$namespace" >/dev/null 2>&1 || {
+    info "Creando namespace $namespace"
+    oc create namespace "$namespace"
+  }
+  
+  # Verificar si ya existe una subscription
+  if oc get subscription openshift-gitops-operator -n "$namespace" >/dev/null 2>&1; then
+    info "El operador OpenShift GitOps ya está suscrito"
+  else
+    # Crear OperatorGroup si no existe
+    if ! oc get operatorgroup -n "$namespace" >/dev/null 2>&1; then
+      cat <<EOF | oc apply -f -
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: openshift-operators
+  namespace: $namespace
+spec:
+  targetNamespaces: []
+EOF
+    fi
+    
+    # Crear Subscription para OpenShift GitOps
+    cat <<EOF | oc apply -f -
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: openshift-gitops-operator
+  namespace: $namespace
+spec:
+  channel: latest
+  name: openshift-gitops-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  installPlanApproval: Automatic
+EOF
+  fi
+  
+  wait_for_operator "openshift-gitops-operator" "$namespace"
+}
+
+wait_for_apiserver_restart() {
+  local namespace=${1:-openshift-apiserver}
+  local max_wait=${2:-600}
+  local elapsed=0
+
+  info "Esperando a que los pods de $namespace se reinicien después de la configuración del proxy..."
+  sleep 30
+
+  while [ $elapsed -lt $max_wait ]; do
+    # Verificar que todos los pods estén Running
+    running_pods=$(oc get pods -n "$namespace" -o jsonpath='{.items[?(@.status.phase=="Running")].metadata.name}' 2>/dev/null | wc -w)
+    total_pods=$(oc get pods -n "$namespace" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | wc -w)
+    
+    if [ "$total_pods" -eq 0 ]; then
+      echo -n "."
+      sleep 10
+      elapsed=$((elapsed + 10))
+      continue
+    fi
+
+    # Verificar que todos los pods estén Ready
+    ready_pods=0
+    for pod in $(oc get pods -n "$namespace" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+      ready_status=$(oc get pod "$pod" -n "$namespace" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "False")
+      if [ "$ready_status" = "True" ]; then
+        ready_pods=$((ready_pods + 1))
+      fi
+    done
+
+    # Si todos los pods están Running y Ready, terminamos
+    if [ "$running_pods" -eq "$total_pods" ] && [ "$ready_pods" -eq "$total_pods" ] && [ "$total_pods" -gt 0 ]; then
+      info "Los pods de $namespace se han reiniciado correctamente y están listos"
+      return 0
+    fi
+
+    echo -n "."
+    sleep 10
+    elapsed=$((elapsed + 10))
+  done
+
+  err "Timeout esperando a que los pods de $namespace se reinicien (esperado: $max_wait segundos)"
+}
+
+configure_router_ca() {
+  info "Configurando el CA del router en el proxy del cluster..."
+
+  # Verificar si el configmap ya existe y el proxy está configurado
+  if oc get configmap custom-ca -n openshift-config >/dev/null 2>&1; then
+    info "El configmap custom-ca ya existe, verificando si el proxy está configurado..."
+    trusted_ca=$(oc get proxy/cluster -o jsonpath='{.spec.trustedCA.name}' 2>/dev/null || echo "")
+    if [ "$trusted_ca" = "custom-ca" ]; then
+      info "El proxy ya está configurado con el CA del router"
+      return 0
+    fi
+  fi
+
+  # Extraer el CA del secret router-ca
+  info "Extrayendo el CA del secret router-ca..."
+  ca_base64=$(oc get secret router-ca -n openshift-ingress-operator -o jsonpath='{.data.tls\.crt}' 2>/dev/null || echo "")
+  if [ -z "$ca_base64" ]; then
+    err "No se pudo obtener el secret router-ca del namespace openshift-ingress-operator"
+  fi
+
+  # Decodificar el base64 y crear archivo temporal
+  tmp_ca_file=$(mktemp)
+  echo "$ca_base64" | base64 -d > "$tmp_ca_file" 2>/dev/null || {
+    err "Error al decodificar el CA del router"
+  }
+
+  # Crear o actualizar el configmap
+  info "Creando configmap custom-ca en openshift-config..."
+  oc create configmap custom-ca --from-file ca-bundle.crt="$tmp_ca_file" -n openshift-config --dry-run=client -o yaml | oc apply -f - >/dev/null 2>&1
+
+  # Parchear el proxy/cluster
+  info "Configurando el proxy/cluster para usar el CA..."
+  oc patch proxy/cluster --type=merge -p '{"spec":{"trustedCA":{"name":"custom-ca"}}}' >/dev/null 2>&1
+
+  # Limpiar archivo temporal
+  rm -f "$tmp_ca_file"
+
+  # Esperar a que los pods de openshift-apiserver se reinicien
+  info "Esperando a que los pods de openshift-apiserver se reinicien..."
+  wait_for_apiserver_restart "openshift-apiserver"
+}
+
+wait_for_pipelines_as_code_route() {
+  local namespace=${1:-openshift-pipelines}
+  local route_name="pipelines-as-code-controller"
+  local max_wait=${2:-600}
+  local elapsed=0
+
+  info "Esperando a que la ruta $route_name esté disponible en el namespace $namespace..."
+  
+  while [ $elapsed -lt $max_wait ]; do
+    # Intentar obtener la ruta primero en openshift-pipelines
+    route=$(oc get route "$route_name" -n "$namespace" -o jsonpath='{.spec.host}' 2>/dev/null || echo "")
+    
+    if [ -n "$route" ] && [ "$route" != "null" ]; then
+      info "Ruta $route_name disponible en $namespace (host: $route)"
+      return 0
+    fi
+    
+    # Si no está en openshift-pipelines, intentar en pipelines-as-code
+    if [ "$namespace" == "openshift-pipelines" ]; then
+      route=$(oc get route "$route_name" -n pipelines-as-code -o jsonpath='{.spec.host}' 2>/dev/null || echo "")
+      if [ -n "$route" ] && [ "$route" != "null" ]; then
+        info "Ruta $route_name disponible en pipelines-as-code (host: $route)"
+        return 0
+      fi
+    fi
+    
+    echo -n "."
+    sleep 10
+    elapsed=$((elapsed + 10))
+  done
+  
+  err "Timeout esperando a que la ruta $route_name esté disponible (esperado: $max_wait segundos)"
+}
+
 command.install() {
   export GIT_SSL_NO_VERIFY=true
   oc version >/dev/null 2>&1 || err "no oc binary found"
+
+  info "Configurando CA del router en el proxy del cluster..."
+  configure_router_ca
+
+  info "Instalando operadores requeridos..."
+  install_openshift_pipelines
+  install_openshift_gitops
+  
+  info "Esperando a que la ruta pipelines-as-code-controller esté disponible..."
+  wait_for_pipelines_as_code_route "openshift-pipelines"
 
   info "Creating namespaces $cicd_prj, $dev_prj, $stage_prj"
   oc get ns "$cicd_prj" 2>/dev/null || {
