@@ -70,7 +70,7 @@ function Wait-ForOperator {
     
     while ($elapsed -lt $MaxWait) {
         try {
-            $subOutput = oc get subscription $SubscriptionName -n $Namespace -o json 2>$null
+            $subOutput = oc get subscriptions.operators.coreos.com $SubscriptionName -n $Namespace -o json 2>$null
             if ($subOutput) {
                 $subscription = $subOutput | ConvertFrom-Json
                 $csv = $subscription.status.installedCSV
@@ -121,8 +121,8 @@ function Install-OpenShiftPipelines {
         oc create namespace $namespace | Out-Null
     }
     
-    # Verificar si ya existe una subscription
-    $subExists = oc get subscription openshift-pipelines-operator-rh -n $namespace 2>$null
+    # Verificar si ya existe una subscription usando el CRD completo
+    $subExists = oc get subscriptions.operators.coreos.com openshift-pipelines-operator-rh -n $namespace 2>$null
     if ($subExists) {
         Write-Info "El operador OpenShift Pipelines ya está suscrito"
     } else {
@@ -173,8 +173,8 @@ function Install-OpenShiftGitOps {
         oc create namespace $namespace | Out-Null
     }
     
-    # Verificar si ya existe una subscription
-    $subExists = oc get subscription openshift-gitops-operator -n $namespace 2>$null
+    # Verificar si ya existe una subscription usando el CRD completo
+    $subExists = oc get subscriptions.operators.coreos.com openshift-gitops-operator -n $namespace 2>$null
     if ($subExists) {
         Write-Info "El operador OpenShift GitOps ya está suscrito"
     } else {
@@ -401,10 +401,23 @@ function Command-Install {
     }
     
     Write-Info "Configure service account permissions for pipeline"
-    oc policy add-role-to-user edit "system:serviceaccount:$cicd_prj:pipeline" -n $dev_prj | Out-Null
-    oc policy add-role-to-user edit "system:serviceaccount:$cicd_prj:pipeline" -n $stage_prj | Out-Null
-    oc policy add-role-to-user system:image-puller "system:serviceaccount:$dev_prj:default" -n $cicd_prj | Out-Null
-    oc policy add-role-to-user system:image-puller "system:serviceaccount:$stage_prj:default" -n $cicd_prj | Out-Null
+    # Verificar y agregar políticas solo si no existen (idempotente)
+    $rbDev = oc get rolebinding -n $dev_prj 2>$null | Select-String "system:serviceaccount:$cicd_prj:pipeline"
+    if (-not $rbDev) {
+        oc policy add-role-to-user edit "system:serviceaccount:$cicd_prj:pipeline" -n $dev_prj 2>$null | Out-Null
+    }
+    $rbStage = oc get rolebinding -n $stage_prj 2>$null | Select-String "system:serviceaccount:$cicd_prj:pipeline"
+    if (-not $rbStage) {
+        oc policy add-role-to-user edit "system:serviceaccount:$cicd_prj:pipeline" -n $stage_prj 2>$null | Out-Null
+    }
+    $rbCicdDev = oc get rolebinding -n $cicd_prj 2>$null | Select-String "system:serviceaccount:$dev_prj:default"
+    if (-not $rbCicdDev) {
+        oc policy add-role-to-user system:image-puller "system:serviceaccount:$dev_prj:default" -n $cicd_prj 2>$null | Out-Null
+    }
+    $rbCicdStage = oc get rolebinding -n $cicd_prj 2>$null | Select-String "system:serviceaccount:$stage_prj:default"
+    if (-not $rbCicdStage) {
+        oc policy add-role-to-user system:image-puller "system:serviceaccount:$stage_prj:default" -n $cicd_prj 2>$null | Out-Null
+    }
     
     Write-Info "Deploying CI/CD infra to $cicd_prj namespace"
     oc apply -f infra -n $cicd_prj | Out-Null
@@ -417,27 +430,53 @@ function Command-Install {
         $webhookUrl = oc get route pipelines-as-code-controller -n openshift-pipelines -o template --template="{{.spec.host}}"
     }
     
-    $giteaConfig = Get-Content "config/gitea-configmap.yaml" -Raw
-    $giteaConfig = $giteaConfig -replace '@HOSTNAME', $giteaHostname
-    $giteaConfig | oc create -f - -n $cicd_prj | Out-Null
+    # Crear o actualizar configmap de Gitea (idempotente)
+    $cmExists = oc get configmap gitea-config -n $cicd_prj 2>$null
+    if (-not $cmExists) {
+        $giteaConfig = Get-Content "config/gitea-configmap.yaml" -Raw
+        $giteaConfig = $giteaConfig -replace '@HOSTNAME', $giteaHostname
+        $giteaConfig | oc apply -f - -n $cicd_prj | Out-Null
+    }
+    oc rollout status deployment/gitea -n $cicd_prj --timeout=5m 2>$null | Out-Null
     
-    oc rollout status deployment/gitea -n $cicd_prj | Out-Null
-    
+    # Crear taskrun siempre con oc create (tiene generateName, no se puede usar apply)
+    Write-Info "Creando TaskRun para inicializar Gitea..."
     $taskrunConfig = Get-Content "config/gitea-init-taskrun.yaml" -Raw
     $taskrunConfig = $taskrunConfig -replace '@webhook-url@', "https://$webhookUrl"
     $taskrunConfig = $taskrunConfig -replace '@gitea-url@', "https://$giteaHostname"
-    $taskrunConfig | oc create -f - -n $cicd_prj | Out-Null
+    $taskrunOutput = $taskrunConfig | oc create -f - -n $cicd_prj 2>&1
     
+    # Extraer el nombre del TaskRun creado (el output será algo como "taskrun.tekton.dev/init-gitea-xxxxx created")
+    $taskrunName = ""
+    if ($taskrunOutput -match 'init-gitea-[\w-]+') {
+        $taskrunName = $matches[0]
+    }
+    
+    if (-not $taskrunName) {
+        # Si no se pudo extraer el nombre, intentar obtenerlo de los TaskRuns existentes
+        $taskrunName = oc get taskrun -n $cicd_prj --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[?(@.metadata.name=~"init-gitea-.*")].metadata.name}' 2>$null
+        if ($taskrunName) {
+            $taskrunName = ($taskrunName -split '\s+')[-1]
+        }
+    }
+    
+    if (-not $taskrunName) {
+        Write-Err "No se pudo obtener el nombre del TaskRun creado"
+    }
+    
+    Write-Info "Esperando a que el TaskRun $taskrunName termine su ejecución..."
     Wait-Seconds -Count 20
     
-    $running = $true
-    while ($running) {
-        $taskruns = oc get taskrun -n $cicd_prj 2>$null
-        if ($taskruns -match "Running") {
-            Write-Host "waiting for Gitea init..."
-            Wait-Seconds -Count 10
+    # Esperar a que el TaskRun termine (no esté Running)
+    $taskrunComplete = $false
+    while (-not $taskrunComplete) {
+        $taskrunStatus = oc get taskrun $taskrunName -n $cicd_prj -o jsonpath='{.status.conditions[?(@.type=="Succeeded")].status}' 2>$null
+        if ($taskrunStatus -eq "True" -or $taskrunStatus -eq "False") {
+            Write-Info "TaskRun $taskrunName terminó con estado: $taskrunStatus"
+            $taskrunComplete = $true
         } else {
-            $running = $false
+            Write-Host "waiting for Gitea init TaskRun to complete..."
+            Wait-Seconds -Count 10
         }
     }
     
@@ -464,32 +503,50 @@ function Command-Install {
     $tmpDir = New-TemporaryFile | ForEach-Object { Remove-Item $_; New-Item -ItemType Directory -Path $_.FullName }
     Push-Location $tmpDir
     
-    git clone "https://$giteaHostname/gitea/spring-petclinic"
+    # Clonar solo si el directorio no existe o está vacío
+    if (-not (Test-Path spring-petclinic) -or (Get-ChildItem spring-petclinic -ErrorAction SilentlyContinue | Measure-Object).Count -eq 0) {
+        git clone "https://$giteaHostname/gitea/spring-petclinic"
+    }
     Set-Location spring-petclinic
     git config user.email "openshift-pipelines@redhat.com"
     git config user.name "openshift-pipelines"
     
-    $buildYaml = Get-Content ".tekton/build.yaml" -Raw
-    $buildYaml = $buildYaml -replace 'https://github.com/siamaksade/spring-petclinic-config', "https://$giteaHostname/gitea/spring-petclinic-config"
-    Set-Content -Path ".tekton/build.yaml" -Value $buildYaml
-    
-    git add .tekton/build.yaml
-    git commit -m "Updated manifests git url"
-    git remote add auth-origin "https://gitea:openshift@$giteaHostname/gitea/spring-petclinic"
-    git push auth-origin cicd-demo
-    
-    Pop-Location
-    
-    Write-Info "Configuring pipelines-as-code"
-    $taskrunName = oc get taskrun -n $cicd_prj -o jsonpath="{.items[0].metadata.name}"
-    $taskrunLogs = oc logs "$taskrunName-pod" -n $cicd_prj
-    $giteaToken = ""
-    $tokenLine = $taskrunLogs | Select-String -Pattern "Token" | Select-Object -First 1
-    if ($tokenLine -match '## Token: (.*) ##') {
-        $giteaToken = $matches[1].Trim()
+    # Verificar si ya está actualizado antes de hacer cambios
+    $buildYamlContent = Get-Content ".tekton/build.yaml" -Raw -ErrorAction SilentlyContinue
+    if ($buildYamlContent -and $buildYamlContent -notmatch "$giteaHostname/gitea/spring-petclinic-config") {
+        $buildYaml = $buildYamlContent
+        $buildYaml = $buildYaml -replace 'https://github.com/siamaksade/spring-petclinic-config', "https://$giteaHostname/gitea/spring-petclinic-config"
+        Set-Content -Path ".tekton/build.yaml" -Value $buildYaml
+        
+        git add .tekton/build.yaml
+        git commit -m "Updated manifests git url" 2>$null | Out-Null
+        git remote remove auth-origin 2>$null | Out-Null
+        git remote add auth-origin "https://gitea:openshift@$giteaHostname/gitea/spring-petclinic" 2>$null | Out-Null
+        git push auth-origin cicd-demo 2>$null | Out-Null
+    } else {
+        Write-Info "El repositorio ya está actualizado con la URL correcta"
     }
     
-    $pacRepository = @"
+    Pop-Location
+    Remove-Item -Path $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
+    
+    Write-Info "Configuring pipelines-as-code"
+    # Verificar si el Repository ya existe
+    $repoExists = oc get repository spring-petclinic -n $cicd_prj 2>$null
+    if ($repoExists) {
+        Write-Info "El Repository pipelines-as-code ya está configurado"
+    } else {
+        # Obtener el token del secret gitea que fue creado por el TaskRun
+        $giteaTokenBase64 = oc get secret gitea -n $cicd_prj -o jsonpath='{.data.token}' 2>$null
+        if ($giteaTokenBase64) {
+            $giteaTokenBytes = [System.Convert]::FromBase64String($giteaTokenBase64)
+            $giteaToken = [System.Text.Encoding]::UTF8.GetString($giteaTokenBytes)
+        }
+        if (-not $giteaToken) {
+            Write-Err "No se pudo obtener el token de Gitea del secret. El TaskRun debe haber fallado."
+        }
+        
+        $pacRepository = @"
 ---
 apiVersion: "pipelinesascode.tekton.dev/v1alpha1"
 kind: Repository
@@ -518,10 +575,12 @@ stringData:
   token: $giteaToken
   webhook: ""
 "@
-    
-    $tmpPacFile = Join-Path $env:TEMP "tmp-pac-repository.yaml"
-    Set-Content -Path $tmpPacFile -Value $pacRepository
-    oc apply -f $tmpPacFile -n $cicd_prj | Out-Null
+        
+        $tmpPacFile = Join-Path $env:TEMP "tmp-pac-repository.yaml"
+        Set-Content -Path $tmpPacFile -Value $pacRepository
+        oc apply -f $tmpPacFile -n $cicd_prj | Out-Null
+        Remove-Item -Path $tmpPacFile -ErrorAction SilentlyContinue
+    }
     
     Wait-Seconds -Count 10
     
@@ -567,8 +626,15 @@ spec:
     }
     
     Write-Info "Grants permissions to ArgoCD instances to manage resources in target namespaces"
-    oc label ns $dev_prj "argocd.argoproj.io/managed-by=$cicd_prj" | Out-Null
-    oc label ns $stage_prj "argocd.argoproj.io/managed-by=$cicd_prj" | Out-Null
+    # Aplicar labels solo si no existen o son diferentes (idempotente)
+    $currentLabelDev = oc get ns $dev_prj -o jsonpath='{.metadata.labels.argocd\.argoproj\.io/managed-by}' 2>$null
+    if ($currentLabelDev -ne $cicd_prj) {
+        oc label ns $dev_prj "argocd.argoproj.io/managed-by=$cicd_prj" --overwrite | Out-Null
+    }
+    $currentLabelStage = oc get ns $stage_prj -o jsonpath='{.metadata.labels.argocd\.argoproj\.io/managed-by}' 2>$null
+    if ($currentLabelStage -ne $cicd_prj) {
+        oc label ns $stage_prj "argocd.argoproj.io/managed-by=$cicd_prj" --overwrite | Out-Null
+    }
     
     oc project $cicd_prj | Out-Null
     

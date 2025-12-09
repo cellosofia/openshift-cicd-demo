@@ -101,8 +101,8 @@ wait_for_operator() {
   info "Esperando a que el operador de la subscription $subscription_name esté completamente instalado..."
   
   while [ $elapsed -lt $max_wait ]; do
-    # Obtener el nombre del CSV instalado desde la subscription
-    csv=$(oc get subscription "$subscription_name" -n "$namespace" -o jsonpath='{.status.installedCSV}' 2>/dev/null || echo "")
+    # Obtener el nombre del CSV instalado desde la subscription usando el CRD completo
+    csv=$(oc get subscriptions.operators.coreos.com "$subscription_name" -n "$namespace" -o jsonpath='{.status.installedCSV}' 2>/dev/null || echo "")
     
     if [ -n "$csv" ] && [ "$csv" != "null" ]; then
       # Verificar que el CSV existe y está en estado Succeeded
@@ -119,7 +119,7 @@ wait_for_operator() {
       fi
     else
       # Si aún no hay CSV instalado, verificar el estado de la subscription
-      install_plan=$(oc get subscription "$subscription_name" -n "$namespace" -o jsonpath='{.status.installPlanRef.name}' 2>/dev/null || echo "")
+      install_plan=$(oc get subscriptions.operators.coreos.com "$subscription_name" -n "$namespace" -o jsonpath='{.status.installPlanRef.name}' 2>/dev/null || echo "")
       if [ -n "$install_plan" ] && [ "$install_plan" != "null" ]; then
         echo -n "[installing]"
       fi
@@ -144,8 +144,8 @@ install_openshift_pipelines() {
     oc create namespace "$namespace"
   }
   
-  # Verificar si ya existe una subscription
-  if oc get subscription openshift-pipelines-operator-rh -n "$namespace" >/dev/null 2>&1; then
+  # Verificar si ya existe una subscription usando el CRD completo
+  if oc get subscriptions.operators.coreos.com openshift-pipelines-operator-rh -n "$namespace" >/dev/null 2>&1; then
     info "El operador OpenShift Pipelines ya está suscrito"
   else
     # Crear OperatorGroup si no existe (aunque openshift-operators ya debería tener uno)
@@ -191,8 +191,8 @@ install_openshift_gitops() {
     oc create namespace "$namespace"
   }
   
-  # Verificar si ya existe una subscription
-  if oc get subscription openshift-gitops-operator -n "$namespace" >/dev/null 2>&1; then
+  # Verificar si ya existe una subscription usando el CRD completo
+  if oc get subscriptions.operators.coreos.com openshift-gitops-operator -n "$namespace" >/dev/null 2>&1; then
     info "El operador OpenShift GitOps ya está suscrito"
   else
     # Crear OperatorGroup si no existe
@@ -372,10 +372,19 @@ command.install() {
   }
 
   info "Configure service account permissions for pipeline"
-  oc policy add-role-to-user edit system:serviceaccount:"$cicd_prj":pipeline -n "$dev_prj"
-  oc policy add-role-to-user edit system:serviceaccount:"$cicd_prj":pipeline -n "$stage_prj"
-  oc policy add-role-to-user system:image-puller system:serviceaccount:"$dev_prj":default -n "$cicd_prj"
-  oc policy add-role-to-user system:image-puller system:serviceaccount:"$stage_prj":default -n "$cicd_prj"
+  # Verificar y agregar políticas solo si no existen (idempotente)
+  if ! oc get rolebinding -n "$dev_prj" 2>/dev/null | grep -q "system:serviceaccount:$cicd_prj:pipeline"; then
+    oc policy add-role-to-user edit system:serviceaccount:"$cicd_prj":pipeline -n "$dev_prj" 2>/dev/null || true
+  fi
+  if ! oc get rolebinding -n "$stage_prj" 2>/dev/null | grep -q "system:serviceaccount:$cicd_prj:pipeline"; then
+    oc policy add-role-to-user edit system:serviceaccount:"$cicd_prj":pipeline -n "$stage_prj" 2>/dev/null || true
+  fi
+  if ! oc get rolebinding -n "$cicd_prj" 2>/dev/null | grep -q "system:serviceaccount:$dev_prj:default"; then
+    oc policy add-role-to-user system:image-puller system:serviceaccount:"$dev_prj":default -n "$cicd_prj" 2>/dev/null || true
+  fi
+  if ! oc get rolebinding -n "$cicd_prj" 2>/dev/null | grep -q "system:serviceaccount:$stage_prj:default"; then
+    oc policy add-role-to-user system:image-puller system:serviceaccount:"$stage_prj":default -n "$cicd_prj" 2>/dev/null || true
+  fi
 
   info "Deploying CI/CD infra to $cicd_prj namespace"
   oc apply -f infra -n "$cicd_prj"
@@ -387,14 +396,42 @@ command.install() {
     WEBHOOK_URL=$(oc get route pipelines-as-code-controller -n openshift-pipelines -o template --template="{{.spec.host}}")
   fi
 
-  sed "s/@HOSTNAME/$GITEA_HOSTNAME/g" config/gitea-configmap.yaml | oc create -f - -n "$cicd_prj"
-  oc rollout status deployment/gitea -n "$cicd_prj"
-  sed "s#@webhook-url@#https://$WEBHOOK_URL#g" config/gitea-init-taskrun.yaml | sed "s#@gitea-url@#https://$GITEA_HOSTNAME#g" | oc create -f - -n "$cicd_prj"
+  # Crear o actualizar configmap de Gitea (idempotente)
+  if ! oc get configmap gitea-config -n "$cicd_prj" >/dev/null 2>&1; then
+    sed "s/@HOSTNAME/$GITEA_HOSTNAME/g" config/gitea-configmap.yaml | oc apply -f - -n "$cicd_prj"
+  fi
+  oc rollout status deployment/gitea -n "$cicd_prj" --timeout=5m 2>/dev/null || true
+  
+  # Crear taskrun siempre con oc create (tiene generateName, no se puede usar apply)
+  info "Creando TaskRun para inicializar Gitea..."
+  taskrun_output=$(sed "s#@webhook-url@#https://$WEBHOOK_URL#g" config/gitea-init-taskrun.yaml | sed "s#@gitea-url@#https://$GITEA_HOSTNAME#g" | oc create -f - -n "$cicd_prj" 2>&1)
+  # Extraer el nombre del TaskRun creado (el output será algo como "taskrun.tekton.dev/init-gitea-xxxxx created")
+  taskrun_name=$(echo "$taskrun_output" | grep -oP 'init-gitea-\S+' | head -1)
+  
+  if [ -z "$taskrun_name" ]; then
+    # Si no se pudo extraer el nombre, intentar obtenerlo de los TaskRuns existentes
+    taskrun_name=$(oc get taskrun -n "$cicd_prj" -l tekton.dev/taskRun=init-gitea --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1].metadata.name}' 2>/dev/null || echo "")
+    if [ -z "$taskrun_name" ]; then
+      # Último recurso: obtener el TaskRun más reciente que empiece con init-gitea
+      taskrun_name=$(oc get taskrun -n "$cicd_prj" --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[?(@.metadata.name=~"init-gitea-.*")].metadata.name}' 2>/dev/null | awk '{print $NF}' || echo "")
+    fi
+  fi
 
+  if [ -z "$taskrun_name" ]; then
+    err "No se pudo obtener el nombre del TaskRun creado"
+  fi
+
+  info "Esperando a que el TaskRun $taskrun_name termine su ejecución..."
   wait_seconds 20
 
-  while oc get taskrun -n "$cicd_prj" | grep Running >/dev/null 2>/dev/null; do
-    echo "waiting for Gitea init..."
+  # Esperar a que el TaskRun termine (no esté Running)
+  while true; do
+    taskrun_status=$(oc get taskrun "$taskrun_name" -n "$cicd_prj" -o jsonpath='{.status.conditions[?(@.type=="Succeeded")].status}' 2>/dev/null || echo "")
+    if [ "$taskrun_status" = "True" ] || [ "$taskrun_status" = "False" ]; then
+      info "TaskRun $taskrun_name terminó con estado: $taskrun_status"
+      break
+    fi
+    echo "waiting for Gitea init TaskRun to complete..."
     wait_seconds 10
   done
 
@@ -414,25 +451,42 @@ command.install() {
   info "Updating pipelinerun values for the demo environment"
   tmp_dir=$(mktemp -d)
   pushd "$tmp_dir"
-  git clone https://"$GITEA_HOSTNAME"/gitea/spring-petclinic
+  # Clonar solo si el directorio no existe o está vacío
+  if [ ! -d spring-petclinic ] || [ -z "$(ls -A spring-petclinic 2>/dev/null)" ]; then
+    git clone https://"$GITEA_HOSTNAME"/gitea/spring-petclinic
+  fi
   cd spring-petclinic
   git config user.email "openshift-pipelines@redhat.com"
   git config user.name "openshift-pipelines"
-  grep -A 2 GIT_REPOSITORY <.tekton/build.yaml
-  cross_sed "s#https://github.com/siamaksade/spring-petclinic-config#https://$GITEA_HOSTNAME/gitea/spring-petclinic-config#g" .tekton/build.yaml
-  grep -A 2 GIT_REPOSITORY <.tekton/build.yaml
-  git status
-  git add .tekton/build.yaml
-  git commit -m "Updated manifests git url"
-  git remote add auth-origin https://gitea:openshift@"$GITEA_HOSTNAME"/gitea/spring-petclinic
-  git push auth-origin cicd-demo
+  # Verificar si ya está actualizado antes de hacer cambios
+  if ! grep -q "$GITEA_HOSTNAME/gitea/spring-petclinic-config" .tekton/build.yaml 2>/dev/null; then
+    grep -A 2 GIT_REPOSITORY <.tekton/build.yaml
+    cross_sed "s#https://github.com/siamaksade/spring-petclinic-config#https://$GITEA_HOSTNAME/gitea/spring-petclinic-config#g" .tekton/build.yaml
+    grep -A 2 GIT_REPOSITORY <.tekton/build.yaml
+    git status
+    git add .tekton/build.yaml
+    git commit -m "Updated manifests git url" || true
+    git remote remove auth-origin 2>/dev/null || true
+    git remote add auth-origin https://gitea:openshift@"$GITEA_HOSTNAME"/gitea/spring-petclinic
+    git push auth-origin cicd-demo || true
+  else
+    info "El repositorio ya está actualizado con la URL correcta"
+  fi
   popd
+  rm -rf "$tmp_dir"
 
   info "Configuring pipelines-as-code"
-  TASKRUN_NAME=$(oc get taskrun -n "$cicd_prj" -o jsonpath="{.items[0].metadata.name}")
-  GITEA_TOKEN=$(oc logs "$TASKRUN_NAME"-pod -n "$cicd_prj" | grep Token | sed 's/^## Token: \(.*\) ##$/\1/g')
+  # Verificar si el Repository ya existe
+  if oc get repository spring-petclinic -n "$cicd_prj" >/dev/null 2>&1; then
+    info "El Repository pipelines-as-code ya está configurado"
+  else
+    # Obtener el token del secret gitea que fue creado por el TaskRun
+    GITEA_TOKEN=$(oc get secret gitea -n "$cicd_prj" -o jsonpath='{.data.token}' 2>/dev/null | base64 -d 2>/dev/null || echo "")
+    if [ -z "$GITEA_TOKEN" ]; then
+      err "No se pudo obtener el token de Gitea del secret. El TaskRun debe haber fallado."
+    fi
 
-  cat <<EOF >/tmp/tmp-pac-repository.yaml
+    cat <<EOF >/tmp/tmp-pac-repository.yaml
 ---
 apiVersion: "pipelinesascode.tekton.dev/v1alpha1"
 kind: Repository
@@ -461,7 +515,9 @@ stringData:
   token: $GITEA_TOKEN
   webhook: ""
 EOF
-  oc apply -f /tmp/tmp-pac-repository.yaml -n "$cicd_prj"
+    oc apply -f /tmp/tmp-pac-repository.yaml -n "$cicd_prj"
+    rm -f /tmp/tmp-pac-repository.yaml
+  fi
 
   wait_seconds 10
 
@@ -498,8 +554,15 @@ EOF
   done
 
   info "Grants permissions to ArgoCD instances to manage resources in target namespaces"
-  oc label ns "$dev_prj" argocd.argoproj.io/managed-by="$cicd_prj"
-  oc label ns "$stage_prj" argocd.argoproj.io/managed-by="$cicd_prj"
+  # Aplicar labels solo si no existen (idempotente)
+  current_label_dev=$(oc get ns "$dev_prj" -o jsonpath='{.metadata.labels.argocd\.argoproj\.io/managed-by}' 2>/dev/null || echo "")
+  if [ "$current_label_dev" != "$cicd_prj" ]; then
+    oc label ns "$dev_prj" argocd.argoproj.io/managed-by="$cicd_prj" --overwrite
+  fi
+  current_label_stage=$(oc get ns "$stage_prj" -o jsonpath='{.metadata.labels.argocd\.argoproj\.io/managed-by}' 2>/dev/null || echo "")
+  if [ "$current_label_stage" != "$cicd_prj" ]; then
+    oc label ns "$stage_prj" argocd.argoproj.io/managed-by="$cicd_prj" --overwrite
+  fi
 
   oc project "$cicd_prj"
 
